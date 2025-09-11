@@ -40,7 +40,7 @@ class ResNetTx(nn.Module):
         self.activation1 = nn.GELU()
 
     def forward(self, x):
-        #out = self.bn1(self.conv1(x))
+        # out = self.bn1(self.conv1(x))
         out = self.activation1(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
@@ -63,10 +63,6 @@ class ResNetRx(nn.Module):
 
     def forward(self, x):
         out = self.activation1(self.bn1(self.conv1(x)))
-        # if verbose == 1:  # 注释掉未定义的变量
-        #     print('encoder arch')
-        #     print(x.shape)
-        #     print(out.shape)
         out = self.layer1(out)
         out = self.layer1_(out)
         out = self.layer2(out)

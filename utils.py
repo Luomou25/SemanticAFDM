@@ -42,7 +42,7 @@ def args_parser():
     # Sequence arguments
     parser.add_argument('--M', type=int, default = 128, help = '# total sucarriers')
     parser.add_argument('--N', type=int, default = 64, help = '# allocated sucarriers')
-    parser.add_argument('--lenCP', type=int, default = 16, help = 'length of CP')
+    parser.add_argument('--lenCP', type=int, default = 0, help = 'length of CP')
     parser.add_argument('--precoding', type=int, default = 1, help = 'DFT precoding or not')
     parser.add_argument('--mapping', type=int, default = 0, help = '0=>OFDMA, 1=>LFDMA, 2=>IFDMA')
     parser.add_argument('--sps', type=int, default = 10, help = 'sample per symbol')
@@ -52,13 +52,15 @@ def args_parser():
     parser.add_argument('--fading', type=int, default = 0, help = 'fading or not')
     parser.add_argument('--clip', type=float, default = 0, help = 'clip ratio > 1; 0. means no clipping')
 
-    parser.add_argument('--BatchSize', type=int, default= 256)
+    parser.add_argument('--BatchSize', type=int, default= 265)
     parser.add_argument('--snr', type=float, default= 10.)
 
     parser.add_argument('--lr', type=float, default= 1e-3, help = "learning rate")
     parser.add_argument('--wd', type=float, default= 0.005, help = "weight decay")
     parser.add_argument('--adamW', type=int, default=1, help="use adamW or not")
     parser.add_argument('--numepoch', type=int, default=100, help="total number of epochs")
+    parser.add_argument('--numepoch1', type=int, default=100, help="total number of epochs")
+    parser.add_argument('--numepoch2', type=int, default=100, help="total number of epochs")
     parser.add_argument('--load', type=int, default= 0, help = 'load trained model')
 
     args = parser.parse_args()
@@ -66,12 +68,18 @@ def args_parser():
 
 
 
-# Windows兼容性修复
+# 获取终端宽度，兼容Windows和Unix系统
 try:
-    _, term_width = os.popen('stty size', 'r').read().split()
-    term_width = int(term_width)
+    # 在Windows上重定向stderr来抑制错误信息
+    import subprocess
+    result = subprocess.run(['stty', 'size'], capture_output=True, text=True)
+    if result.returncode == 0:
+        _, term_width = result.stdout.strip().split()
+        term_width = int(term_width)
+    else:
+        term_width = 80
 except:
-    # Windows系统默认终端宽度
+    # Windows系统或其他不支持stty的系统，使用默认值
     term_width = 80
 
 TOTAL_BAR_LENGTH = 25.

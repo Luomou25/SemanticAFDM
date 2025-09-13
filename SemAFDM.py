@@ -69,17 +69,6 @@ class SemanticComm(nn.Module):
         # 固定AFDM参数（第一阶段使用）
         self.fixed_c1 = torch.tensor(0.1, dtype=torch.float32)
         self.fixed_c2 = torch.tensor(0.0, dtype=torch.float32)
-        
-        # load RRC pulse
-        self.RRC, self.lenRRC = get_RRC()
-        # generate carrier
-        fc = 25e6  # carrier frequency
-        fb = 10e6  # baseband frequency
-        fs = fb * self.args.sps  # sampling rate
-        numSamples = int(256/self.N) * (self.N+self.args.lenCP) * self.args.sps + self.lenRRC * 2
-        tt = torch.arange(0, numSamples/fs, 1/fs)
-        self.register_buffer('carrier_cos', torch.sqrt(torch.tensor(2.0)) * torch.cos(2 * np.pi * fc * tt))
-        self.register_buffer('carrier_sin', torch.sqrt(torch.tensor(2.0)) * torch.sin(2 * np.pi * fc * tt))
 
     def set_channel_parameters(self, epoch):
         """为当前epoch设置随机信道参数，每5个epoch变化一次"""
@@ -135,27 +124,6 @@ class SemanticComm(nn.Module):
         sig_out = (sig_in - sig_mean.unsqueeze(dim=1)) / (sig_std.unsqueeze(dim=1) + 1e-8)
         return sig_out.reshape(in_shape)
 
-    def pulse_filter_complex_sig(self, x):
-        xreal = F.conv1d(x[:, :, 0].unsqueeze(1), self.RRC.flip(dims=[2]).to(self.args.device), 
-                         stride=1, padding=self.lenRRC-1)
-        ximag = F.conv1d(x[:, :, 1].unsqueeze(1), self.RRC.flip(dims=[2]).to(self.args.device), 
-                         stride=1, padding=self.lenRRC-1)
-        # convert back to complex
-        x = torch.cat([xreal.squeeze(1).unsqueeze(2), ximag.squeeze(1).unsqueeze(2)], dim=2)
-        return torch.view_as_complex(x)
-
-    def compute_PAPR(self, x_t, len_data_t):
-        # truncation, only compute the PAPR of the signal part
-        truncloc = torch.arange(int((self.lenRRC+1)/2), int(((self.lenRRC+1)/2+len_data_t*self.args.sps)))
-        x_t = torch.index_select(x_t, 1, truncloc.to(self.args.device))
-        # compute PAPR
-        data_t_power = torch.square(torch.abs(x_t))
-        meanPower = torch.mean(data_t_power, dim=1)
-        maxPower = torch.max(data_t_power, dim=1).values
-        PAPRdB = 10 * torch.log10(maxPower/meanPower)
-        PAPRloss = F.relu(PAPRdB - self.args.thres).mean()
-        return PAPRdB, PAPRloss
-
     def generate_channel_matrix(self, N, c1):
         # 检查缓存
         if not self.training and (self.channel_matrix_cache is not None and 
@@ -210,13 +178,6 @@ class SemanticComm(nn.Module):
             self.register_buffer('cached_c1', c1)
         
         return H
-
-    def clip(self, x):
-        x_power_mean_amp = torch.sqrt(torch.mean(torch.square(x), dim=1))
-        thres = self.args.clip * x_power_mean_amp
-        non_neg_diff = F.relu(torch.abs(x) - thres.unsqueeze(1))
-        x = (1 - non_neg_diff/(torch.abs(x)+1e-8)) * x  # scale the symbol with amplitude larger than thres
-        return x
 
     def AFDM_modulation(self, X, c1, c2):
         """
@@ -315,13 +276,8 @@ class SemanticComm(nn.Module):
         # AFDM调制
         data_t = self.AFDM_modulation(x, c1, c2)
         
-        # add CP
-        len_data_t = numAFDM * (self.N + self.args.lenCP)
-        if self.args.lenCP != 0:
-            data_t = torch.cat([data_t[:, :, -self.args.lenCP:], data_t], dim=-1)
-        
         # 生成当前参数下的信道矩阵
-        H = self.generate_channel_matrix(self.N + self.args.lenCP, c1)
+        H = self.generate_channel_matrix(self.N, c1)
         
         # 对每个AFDM符号应用多径和多普勒
         data_t_channel = torch.zeros_like(data_t)
@@ -330,83 +286,64 @@ class SemanticComm(nn.Module):
                 data_t_channel[b, t] = H @ data_t[b, t]
         
         # reshape back to a packet
-        data_t = data_t_channel.view(inputBS, len_data_t)
-
-        # oversampling
-        data_t_over = torch.zeros(inputBS, len_data_t*self.args.sps, dtype=torch.complex64).to(self.args.device)
-        data_t_over[:, np.arange(0, len_data_t*self.args.sps, self.args.sps)] = data_t
-        # pulse shaping (real in, complex out)
-        data_t_over = torch.view_as_real(data_t_over)
-        data_x = self.pulse_filter_complex_sig(data_t_over)
-        # RF signal (real)
-        data_x = data_x.real * self.carrier_cos[:data_x.size(1)] - data_x.imag * self.carrier_sin[:data_x.size(1)]
-        # clipping
-        if self.args.clip != 0.0:
-            data_x = self.clip(data_x)
-        # compute PAPR
-        PAPRdB, PAPRloss = self.compute_PAPR(data_x, len_data_t)
+        data_t = data_t_channel.view(inputBS, numAFDM * self.N)
 
         # =================================================================================== Channel
-        # 添加噪声到RF信号
-        signal_power = torch.mean(torch.square(data_x))
+        # 添加噪声到基带信号
+        signal_power = torch.mean(torch.abs(data_t)**2)
         snr_linear = 10**(self.args.snr / 10)
         noise_power = signal_power / snr_linear
         
-        # 生成实高斯噪声
-        noise_std = torch.sqrt(noise_power).item()  
-        noise = torch.normal(0.0, noise_std, data_x.shape, device=self.args.device)
-        data_r = data_x + noise
+        # 生成复高斯噪声
+        noise_std = torch.sqrt(noise_power/2).item()  
+        noise_real = torch.normal(0.0, noise_std, data_t.shape, device=self.args.device)
+        noise_imag = torch.normal(0.0, noise_std, data_t.shape, device=self.args.device)
+        noise = torch.complex(noise_real, noise_imag)
+        data_r = data_t + noise
+        
         # =================================================================================== demodulation
-        # baseband signal
-        data_r_real = data_r * self.carrier_cos[:data_r.size(1)]
-        data_r_imag = data_r * -self.carrier_sin[:data_r.size(1)]
-        data_r_cpx = torch.cat([data_r_real.unsqueeze(2), data_r_imag.unsqueeze(2)], dim=2)
-
-        # matched filtering (real in, complex out)
-        data_r_filtered = self.pulse_filter_complex_sig(data_r_cpx)
-
-        # synchronization and samling
-        samplingloc = torch.arange(self.lenRRC-1, data_r_filtered.size(1)-self.lenRRC, self.args.sps)
-        y = torch.index_select(data_r_filtered, 1, samplingloc.to(self.args.device))
-  
-        # remove CP
-        y = y.view(inputBS, numAFDM, self.N+self.args.lenCP)
-        y = y[:, :, self.args.lenCP:]
-        '''
-        # MMSE均衡
-        signal_power = torch.mean(torch.abs(y)**2)
-        snr_linear = 10**(self.args.snr / 10)
-        noise_power = signal_power / snr_linear
-        sigma2 = noise_power
+        # reshape to AFDM symbols
+        data_r = data_r.view(inputBS, numAFDM, self.N)
         
-        # MMSE均衡器
-        # 为解调创建NxN的信道矩阵
-        H_demod = self.generate_channel_matrix(self.N, c1)
-        I = torch.eye(self.N, dtype=torch.complex64, device=y.device)
-
-        # 使用与AFDM.py相同的MMSE计算方法
+        # AFDM解调
+        y = self.AFDM_demodulation(data_r, c1, c2)
+        
+        # =================================================================================== MMSE均衡 (时频域均衡)
+        # 计算有效信道矩阵
+        n = torch.arange(self.N, device=self.args.device, dtype=torch.float32)
+        L1 = torch.diag(torch.exp(-1j * 2 * np.pi * c1 * (n ** 2)))
+        L2 = torch.diag(torch.exp(-1j * 2 * np.pi * c2 * (n ** 2)))
+        F = torch.fft.fft(torch.eye(self.N, device=self.args.device, dtype=torch.complex64), dim=0) / np.sqrt(self.N)
+        
+        # 调制和解调矩阵
+        IA = L1.conj().T @ F.conj().T @ L2.conj().T  # 调制矩阵
+        A = L2 @ F @ L1  # 解调矩阵
+        
+        # 计算等效信道矩阵
+        H_eff = A @ H @ IA
+        
+        # 计算MMSE均衡器
+        sigma2 = noise_power
+        I = torch.eye(self.N, dtype=torch.complex64, device=self.args.device)
         W_mmse = torch.linalg.solve(
-            H_demod.conj().T @ H_demod + sigma2 * I, 
-            H_demod.conj().T
+            H_eff.conj().T @ H_eff + sigma2 * I, 
+            H_eff.conj().T
         )
-
-        # 应用MMSE均衡 - 使用批量矩阵乘法
+        
+        # 应用MMSE均衡
         y_reshaped = y.reshape(-1, self.N)  # [inputBS * numAFDM, N]
         y_eq_reshaped = y_reshaped @ W_mmse.T
         y_eq = y_eq_reshaped.reshape(inputBS, numAFDM, self.N)
-        '''
-        # AFDM解调
-        y = self.AFDM_demodulation(y, c1, c2)
         
         # reshape to a packet, BS*4*64 -> BS*256
-        y = y.view(inputBS, numAFDM * self.N)
+        y = y_eq.view(inputBS, numAFDM * self.N)
         # complex to real, BS*256*2
         y = torch.view_as_real(y)
         # reshape to a compressed image
         y = y.view(y.size(0), 8, 8, 8)
         y = self.Dec(y)
 
-        return y, PAPRdB, PAPRloss, c1, c2
+        return y, torch.tensor(0.0), torch.tensor(0.0), c1, c2
 
 def train_stage1(epoch, args, model, trainloader, best_PSNR, writer=None):
     """第一阶段训练：固定信道参数和AFDM参数，训练语义通信部分"""
@@ -424,8 +361,6 @@ def train_stage1(epoch, args, model, trainloader, best_PSNR, writer=None):
             param.requires_grad = True
     
     total_loss = 0.0
-    total_PAPRdB = 0.0
-    total_PAPRloss = 0.0
     batch_count = 0
     
     for batch_idx, (inputs, _) in enumerate(trainloader):
@@ -435,13 +370,10 @@ def train_stage1(epoch, args, model, trainloader, best_PSNR, writer=None):
         args.optimizer_stage1.zero_grad()
         
         # 前向传播（使用阶段1）
-        outputs, PAPRdB, PAPRloss, c1_val, c2_val = model(inputs, stage=1)
+        outputs, _, _, c1_val, c2_val = model(inputs, stage=1)
         
         # 计算损失
-        if args.lamb == 0.0:
-            loss = args.loss(outputs, inputs)
-        else:
-            loss = args.loss(outputs, inputs) + args.lamb * PAPRloss
+        loss = args.loss(outputs, inputs)
         
         # 反向传播
         loss.backward()
@@ -454,17 +386,13 @@ def train_stage1(epoch, args, model, trainloader, best_PSNR, writer=None):
         
         # 累积统计信息
         total_loss += loss.item()
-        total_PAPRdB += PAPRdB.mean().item()
-        total_PAPRloss += PAPRloss.mean().item()
         batch_count += 1
         
         # 记录到TensorBoard (每个batch)
         if writer is not None:
             global_step = epoch * len(trainloader) + batch_idx
             writer.add_scalar('Stage1/Train/Batch_Loss', loss.item(), global_step)
-            writer.add_scalar('Stage1/Train/Batch_PAPRdB', PAPRdB.mean().item(), global_step)
-            writer.add_scalar('Stage1/Train/Batch_PAPRloss', PAPRloss.mean().item(), global_step)
-            writer.add_scalar('Stage1/Train/Batch_MSE', args.loss(outputs, inputs).item(), global_step)
+            writer.add_scalar('Stage1/Train/Batch_MSE', loss.item(), global_step)
             writer.add_scalar('Stage1/Train/c1', c1_val.item(), global_step)
             writer.add_scalar('Stage1/Train/c2', c2_val.item(), global_step)
             
@@ -479,24 +407,18 @@ def train_stage1(epoch, args, model, trainloader, best_PSNR, writer=None):
                 writer.add_images('Stage1/Images/Error', error_images, global_step)
         
         # 显示进度
-        progress_bar(batch_idx, len(trainloader), 'Stage1 - bestPSNR: %.2f, MSE: %.4f, PAPRdB: %.4f, c1: %.4f, c2: %.4f, SNR: %.1fdB'%(best_PSNR, loss.item(), PAPRdB.mean().item(), c1_val.item(), c2_val.item(), args.snr))
+        progress_bar(batch_idx, len(trainloader), 'Stage1 - bestPSNR: %.2f, MSE: %.4f, c1: %.4f, c2: %.4f, SNR: %.1fdB'%(best_PSNR, loss.item(), c1_val.item(), c2_val.item(), args.snr))
     
     # 打印epoch总结
     avg_loss = total_loss / batch_count
-    avg_PAPRdB = total_PAPRdB / batch_count
-    avg_PAPRloss = total_PAPRloss / batch_count
     print(f'Stage1 - Epoch {epoch} Summary:')
     print(f'  Avg MSE: {format_number(avg_loss, 4)}')
-    print(f'  Avg PAPRdB: {format_number(avg_PAPRdB, 4)}')
-    print(f'  Avg PAPRloss: {format_number(avg_PAPRloss, 4)}')
     print(f'  c1: {format_number(c1_val.item(), 4)}')
     print(f'  c2: {format_number(c2_val.item(), 4)}')
     
     # 记录到TensorBoard (每个epoch)
     if writer is not None:
         writer.add_scalar('Stage1/Train/Epoch_Loss', avg_loss, epoch)
-        writer.add_scalar('Stage1/Train/Epoch_PAPRdB', avg_PAPRdB, epoch)
-        writer.add_scalar('Stage1/Train/Epoch_PAPRloss', avg_PAPRloss, epoch)
         writer.add_scalar('Stage1/Train/Epoch_c1', c1_val.item(), epoch)
         writer.add_scalar('Stage1/Train/Epoch_c2', c2_val.item(), epoch)
 
@@ -516,8 +438,6 @@ def train_stage2(epoch, args, model, trainloader, best_PSNR, writer=None):
             param.requires_grad = False
     
     total_loss = 0.0
-    total_PAPRdB = 0.0
-    total_PAPRloss = 0.0
     batch_count = 0
     
     for batch_idx, (inputs, _) in enumerate(trainloader):
@@ -527,13 +447,10 @@ def train_stage2(epoch, args, model, trainloader, best_PSNR, writer=None):
         args.optimizer_stage2.zero_grad()
         
         # 前向传播（使用阶段2）
-        outputs, PAPRdB, PAPRloss, c1_val, c2_val = model(inputs, stage=2)
+        outputs, _, _, c1_val, c2_val = model(inputs, stage=2)
         
         # 计算损失
-        if args.lamb == 0.0:
-            loss = args.loss(outputs, inputs)
-        else:
-            loss = args.loss(outputs, inputs) + args.lamb * PAPRloss
+        loss = args.loss(outputs, inputs)
         
         # 反向传播
         loss.backward()
@@ -546,17 +463,13 @@ def train_stage2(epoch, args, model, trainloader, best_PSNR, writer=None):
         
         # 累积统计信息
         total_loss += loss.item()
-        total_PAPRdB += PAPRdB.mean().item()
-        total_PAPRloss += PAPRloss.mean().item()
         batch_count += 1
         
         # 记录到TensorBoard (每个batch)
         if writer is not None:
             global_step = epoch * len(trainloader) + batch_idx
             writer.add_scalar('Stage2/Train/Batch_Loss', loss.item(), global_step)
-            writer.add_scalar('Stage2/Train/Batch_PAPRdB', PAPRdB.mean().item(), global_step)
-            writer.add_scalar('Stage2/Train/Batch_PAPRloss', PAPRloss.mean().item(), global_step)
-            writer.add_scalar('Stage2/Train/Batch_MSE', args.loss(outputs, inputs).item(), global_step)
+            writer.add_scalar('Stage2/Train/Batch_MSE', loss.item(), global_step)
             writer.add_scalar('Stage2/Train/c1', c1_val.item(), global_step)
             writer.add_scalar('Stage2/Train/c2', c2_val.item(), global_step)
             
@@ -571,24 +484,18 @@ def train_stage2(epoch, args, model, trainloader, best_PSNR, writer=None):
                 writer.add_images('Stage2/Images/Error', error_images, global_step)
         
         # 显示进度
-        progress_bar(batch_idx, len(trainloader), 'Stage2 - bestPSNR: %.2f, MSE: %.4f, PAPRdB: %.4f, c1: %.4f, c2: %.4f, SNR: %.1fdB'%(best_PSNR, loss.item(), PAPRdB.mean().item(), c1_val.item(), c2_val.item(), args.snr))
+        progress_bar(batch_idx, len(trainloader), 'Stage2 - bestPSNR: %.2f, MSE: %.4f, c1: %.4f, c2: %.4f, SNR: %.1fdB'%(best_PSNR, loss.item(), c1_val.item(), c2_val.item(), args.snr))
     
     # 打印epoch总结
     avg_loss = total_loss / batch_count
-    avg_PAPRdB = total_PAPRdB / batch_count
-    avg_PAPRloss = total_PAPRloss / batch_count
     print(f'Stage2 - Epoch {epoch} Summary:')
     print(f'  Avg MSE: {format_number(avg_loss, 4)}')
-    print(f'  Avg PAPRdB: {format_number(avg_PAPRdB, 4)}')
-    print(f'  Avg PAPRloss: {format_number(avg_PAPRloss, 4)}')
     print(f'  c1: {format_number(c1_val.item(), 4)}')
     print(f'  c2: {format_number(c2_val.item(), 4)}')
     
     # 记录到TensorBoard (每个epoch)
     if writer is not None:
         writer.add_scalar('Stage2/Train/Epoch_Loss', avg_loss, epoch)
-        writer.add_scalar('Stage2/Train/Epoch_PAPRdB', avg_PAPRdB, epoch)
-        writer.add_scalar('Stage2/Train/Epoch_PAPRloss', avg_PAPRloss, epoch)
         writer.add_scalar('Stage2/Train/Epoch_c1', c1_val.item(), epoch)
         writer.add_scalar('Stage2/Train/Epoch_c2', c2_val.item(), epoch)
 
@@ -604,16 +511,12 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
         for batch_idx, (inputs, _) in enumerate(testloader):
             b,c,h,w=inputs.shape[0],inputs.shape[1],inputs.shape[2],inputs.shape[3]
             inputs = inputs.to(args.device)
-            outputs, PAPRdB, _, c1_val, c2_val = model(inputs, stage=stage)
+            outputs, _, _, c1_val, c2_val = model(inputs, stage=stage)
             loss = MSEnoAvg(outputs, inputs)
             MSE_each_image = (torch.sum(loss.view(b,-1),dim=1))/(c*h*w)
             PSNR_each_image = 10 * torch.log10(1 / MSE_each_image)
             one_batch_PSNR = PSNR_each_image.data.cpu().numpy()
             psnr_all_list.extend(one_batch_PSNR)
-            if batch_idx == 0:
-                PAPRdBarray = PAPRdB
-            else:
-                PAPRdBarray = torch.cat([PAPRdBarray, PAPRdB],dim=0)
         test_PSNR=np.mean(psnr_all_list)
         test_PSNR=np.around(test_PSNR,5)
         
@@ -625,7 +528,6 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
         print(f"{stage_str} - Epoch {epoch} Test Results:")
         print(f"  Test PSNR: {format_number(test_PSNR, 5)}")
         print(f"  Mean MSE: {format_number(avg_MSE, 6)}")
-        print(f"  Mean PAPR: {format_number(PAPRdBarray.mean(), 4)}")
         print(f"  c1: {format_number(c1_val.item(), 4)}")
         print(f"  c2: {format_number(c2_val.item(), 4)}")
         print(f"  SNR: {format_number(args.snr, 1)}dB")
@@ -635,7 +537,6 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
         if writer is not None:
             writer.add_scalar(f'{stage_str}/Test/PSNR', test_PSNR, epoch)
             writer.add_scalar(f'{stage_str}/Test/MSE', avg_MSE, epoch)
-            writer.add_scalar(f'{stage_str}/Test/PAPR', PAPRdBarray.mean().cpu().numpy(), epoch)
             writer.add_scalar(f'{stage_str}/Test/c1', c1_val.item(), epoch)
             writer.add_scalar(f'{stage_str}/Test/c2', c2_val.item(), epoch)
             writer.add_scalar(f'{stage_str}/Test/SNR', args.snr, epoch)
@@ -672,7 +573,6 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
                 'epoch': epoch,
                 'model': model.state_dict(),
                 'test_PSNR': test_PSNR,
-                'PAPR': PAPRdBarray,
             }
 
             filename = f"{stage_str}_snr{int(args.snr)}_precoding{args.precoding}_mapping{args.mapping}_lamb{args.lamb}_clip{args.clip}_fading{args.fading}_hstd{args.hstd}"
@@ -683,7 +583,7 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
             best_PSNR = test_PSNR
 
             # save matlab file
-            mdic = {"PSNR": best_PSNR, "PAPRarray": PAPRdBarray.cpu().numpy()}
+            mdic = {"PSNR": best_PSNR}
             savemat("./checkpoint/" + filename + ".mat", mdic)
 
         return best_PSNR

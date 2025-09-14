@@ -11,7 +11,7 @@ from utils import load_CIFAR10, get_RRC, args_parser, progress_bar
 from resnet import ResNetTx, ResNetRx
 from scipy.io import savemat
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # set seeds
 torch.manual_seed(0)
@@ -86,14 +86,14 @@ class SemanticComm(nn.Module):
         torch.manual_seed(channel_group)
         
         # 随机生成信道参数
-        # 信道系数 (复数)
-        h_real = torch.randn(self.P) * 0.5
-        h_imag = torch.randn(self.P) * 0.5
+        # 信道系数 (复数) 
+        h_real = torch.normal(0, 1, (self.P,))  
+        h_imag = torch.normal(0, 1, (self.P,))
         h = torch.complex(h_real, h_imag)
         # 归一化信道系数
         h = h / torch.sqrt(torch.sum(torch.abs(h)**2))
         
-        # 随机延迟 (整数，在CP长度范围内)
+        # 随机延迟 
         max_delay = 5
         normDelays = torch.randint(0, max_delay+1, (self.P,)).float()
         
@@ -239,17 +239,17 @@ class SemanticComm(nn.Module):
         """获取当前AFDM参数值"""
         return self.c1.item(), self.c2.item()
 
-    def forward(self, x, stage=1):
+    def forward(self, x, stage=1, return_symbols=False):
         inputBS = x.shape[0]
         
         # =================================================================================== Encoding
-        x = self.Enc(x)
+        x_enc = self.Enc(x)
         # power norm
-        x = self.power_norm(x)
+        x_norm = self.power_norm(x_enc)
         # reshape to a vector BS*256*2 (for construting complex symbols)
-        x = x.view(inputBS, 256, 2)
+        x_reshaped = x_norm.view(inputBS, 256, 2)
         # (512 real symbols) to (256 complex symbols); power of real = 1; power of complex = 2
-        x = torch.view_as_complex(x)
+        x_symbols = torch.view_as_complex(x_reshaped)
         
         # =================================================================================== AFDM参数选择
         if stage == 1:
@@ -271,10 +271,10 @@ class SemanticComm(nn.Module):
         
         # =================================================================================== AFDM modulation
         numAFDM = int(256/self.N)
-        x = x.view(inputBS, numAFDM, self.N)
+        x_afdm = x_symbols.view(inputBS, numAFDM, self.N)
         
         # AFDM调制
-        data_t = self.AFDM_modulation(x, c1, c2)
+        data_t = self.AFDM_modulation(x_afdm, c1, c2)
         
         # 生成当前参数下的信道矩阵
         H = self.generate_channel_matrix(self.N, c1)
@@ -306,7 +306,7 @@ class SemanticComm(nn.Module):
         data_r = data_r.view(inputBS, numAFDM, self.N)
         
         # AFDM解调
-        y = self.AFDM_demodulation(data_r, c1, c2)
+        y_demod = self.AFDM_demodulation(data_r, c1, c2)
         
         # =================================================================================== MMSE均衡 (时频域均衡)
         # 计算有效信道矩阵
@@ -331,19 +331,91 @@ class SemanticComm(nn.Module):
         )
         
         # 应用MMSE均衡
-        y_reshaped = y.reshape(-1, self.N)  # [inputBS * numAFDM, N]
+        y_reshaped = y_demod.reshape(-1, self.N)  # [inputBS * numAFDM, N]
         y_eq_reshaped = y_reshaped @ W_mmse.T
         y_eq = y_eq_reshaped.reshape(inputBS, numAFDM, self.N)
         
         # reshape to a packet, BS*4*64 -> BS*256
-        y = y_eq.view(inputBS, numAFDM * self.N)
+        y_symbols = y_eq.view(inputBS, numAFDM * self.N)
+        
+        if return_symbols:
+            return x_symbols, y_symbols, c1, c2
+        
         # complex to real, BS*256*2
-        y = torch.view_as_real(y)
+        y_real = torch.view_as_real(y_symbols)
         # reshape to a compressed image
-        y = y.view(y.size(0), 8, 8, 8)
-        y = self.Dec(y)
+        y_reshaped_dec = y_real.view(y_real.size(0), 8, 8, 8)
+        y_decoded = self.Dec(y_reshaped_dec)
 
-        return y, torch.tensor(0.0), torch.tensor(0.0), c1, c2
+        return y_decoded, torch.tensor(0.0), torch.tensor(0.0), c1, c2
+
+def calculate_ber(x_symbols, y_symbols, M=16):
+    """
+    计算发射符号和接收符号之间的BER
+    x_symbols: 发射符号 [batch_size, num_symbols]
+    y_symbols: 接收符号 [batch_size, num_symbols]
+    M: QAM调制阶数
+    """
+    # 将符号映射到最近的QAM星座点
+    x_constellation = qam_modulate(qam_demodulate(x_symbols, M), M)
+    y_constellation = qam_modulate(qam_demodulate(y_symbols, M), M)
+    
+    # 计算误码率
+    errors = torch.sum(x_constellation != y_constellation)
+    total_bits = x_symbols.numel() * int(math.log2(M))
+    ber = errors.float() / total_bits
+    
+    return ber.item()
+
+def qam_demodulate(symbols, M):
+    """
+    QAM解调，将符号映射到比特
+    symbols: 复数符号
+    M: 调制阶数
+    """
+    # 计算星座点并确保在正确的设备上
+    constellation = create_qam_constellation(M).to(symbols.device)
+    
+    # 找到每个符号最近的星座点
+    symbols_flat = symbols.view(-1)
+    symbols_reshaped = symbols_flat.unsqueeze(1).expand(-1, len(constellation))
+    distances = torch.abs(symbols_reshaped - constellation)
+    indices = torch.argmin(distances, dim=1)
+    
+    return indices
+
+def qam_modulate(bits, M):
+    """
+    QAM调制，将比特映射到符号
+    bits: 比特序列
+    M: 调制阶数
+    """
+    constellation = create_qam_constellation(M).to(bits.device)
+    return constellation[bits]
+
+def create_qam_constellation(M):
+    """
+    创建QAM星座点
+    M: 调制阶数
+    """
+    # 计算星座点数量
+    k = int(math.sqrt(M))
+    if k**2 != M:
+        raise ValueError("M must be a perfect square")
+    
+    # 创建星座点
+    real_values = torch.linspace(-1, 1, k)
+    imag_values = torch.linspace(-1, 1, k)
+    constellation = torch.complex(
+        real_values.repeat_interleave(k),
+        imag_values.repeat(k)
+    )
+    
+    # 归一化星座点功率
+    power = torch.mean(torch.abs(constellation)**2)
+    constellation = constellation / torch.sqrt(power)
+    
+    return constellation
 
 def train_stage1(epoch, args, model, trainloader, best_PSNR, writer=None):
     """第一阶段训练：固定信道参数和AFDM参数，训练语义通信部分"""
@@ -503,6 +575,7 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
     model.eval()
     psnr_all_list = []
     MSEnoAvg = nn.MSELoss(reduction = 'none')
+    ber_list = []
     
     # 为测试设置固定的信道参数（使用组0）
     model.set_channel_parameters(0)
@@ -511,14 +584,27 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
         for batch_idx, (inputs, _) in enumerate(testloader):
             b,c,h,w=inputs.shape[0],inputs.shape[1],inputs.shape[2],inputs.shape[3]
             inputs = inputs.to(args.device)
+            
+            # 获取输出和符号
             outputs, _, _, c1_val, c2_val = model(inputs, stage=stage)
+            
+            # 获取发射和接收符号
+            x_symbols, y_symbols, _, _ = model(inputs, stage=stage, return_symbols=True)
+            
+            # 计算BER
+            ber = calculate_ber(x_symbols, y_symbols, M=16)
+            ber_list.append(ber)
+            
+            # 计算PSNR
             loss = MSEnoAvg(outputs, inputs)
             MSE_each_image = (torch.sum(loss.view(b,-1),dim=1))/(c*h*w)
             PSNR_each_image = 10 * torch.log10(1 / MSE_each_image)
             one_batch_PSNR = PSNR_each_image.data.cpu().numpy()
             psnr_all_list.extend(one_batch_PSNR)
+            
         test_PSNR=np.mean(psnr_all_list)
         test_PSNR=np.around(test_PSNR,5)
+        test_BER=np.mean(ber_list)
         
         # 计算平均MSE (从PSNR转换)
         # PSNR = 10 * log10(1/MSE), 所以 MSE = 10^(-PSNR/10)
@@ -527,6 +613,7 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
         stage_str = "Stage1" if stage == 1 else "Stage2"
         print(f"{stage_str} - Epoch {epoch} Test Results:")
         print(f"  Test PSNR: {format_number(test_PSNR, 5)}")
+        print(f"  Test BER: {format_number(test_BER, 6)}")
         print(f"  Mean MSE: {format_number(avg_MSE, 6)}")
         print(f"  c1: {format_number(c1_val.item(), 4)}")
         print(f"  c2: {format_number(c2_val.item(), 4)}")
@@ -536,6 +623,7 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
         # 记录到TensorBoard
         if writer is not None:
             writer.add_scalar(f'{stage_str}/Test/PSNR', test_PSNR, epoch)
+            writer.add_scalar(f'{stage_str}/Test/BER', test_BER, epoch)
             writer.add_scalar(f'{stage_str}/Test/MSE', avg_MSE, epoch)
             writer.add_scalar(f'{stage_str}/Test/c1', c1_val.item(), epoch)
             writer.add_scalar(f'{stage_str}/Test/c2', c2_val.item(), epoch)
@@ -573,6 +661,7 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
                 'epoch': epoch,
                 'model': model.state_dict(),
                 'test_PSNR': test_PSNR,
+                'test_BER': test_BER,
             }
 
             filename = f"{stage_str}_snr{int(args.snr)}_precoding{args.precoding}_mapping{args.mapping}_lamb{args.lamb}_clip{args.clip}_fading{args.fading}_hstd{args.hstd}"
@@ -583,7 +672,7 @@ def test(epoch, args, model, testloader, best_PSNR, saveflag = 1, writer=None, s
             best_PSNR = test_PSNR
 
             # save matlab file
-            mdic = {"PSNR": best_PSNR}
+            mdic = {"PSNR": best_PSNR, "BER": test_BER}
             savemat("./checkpoint/" + filename + ".mat", mdic)
 
         return best_PSNR
@@ -681,9 +770,10 @@ def main(model, args):
 if __name__ == '__main__':
     # ======================================================= parse args
     args = args_parser()
-    args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    args.device = 'cuda' 
     args.loss = nn.MSELoss()
-    
+    print(args.device)
+
     # 添加两阶段训练的epoch数
     args.numepoch1 = 100  # 第一阶段epoch数
     args.numepoch2 = 100  # 第二阶段epoch数
